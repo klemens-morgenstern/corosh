@@ -108,8 +108,6 @@ struct session
   using native_handle_type = ssh_session;
   native_handle_type native_handle() const noexcept {return session_.get(); }
 
-  channel new_channel();
-
  private:
 
   friend struct channel;
