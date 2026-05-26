@@ -208,6 +208,82 @@ unsigned int session::userauth_list()
   return ssh_userauth_list(session_.get(), nullptr);
 }
 
+template<typename Function>
+boost::capy::io_task<> session::do_op_(Function f)
+{
+  for (;;)
+  {
+    auto rc = f();
+    if (rc == SSH_OK)
+      co_return {};
+    if (rc == SSH_ERROR)
+      co_return std::error_code(ssh_get_error_code(session_.get()), ssh_category());
+
+    std::error_code ec;
+    auto r = ssh_get_poll_flags(session_.get());
+    if (r == SSH_READ_PENDING)
+      ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
+    else if (r == SSH_WRITE_PENDING)
+      ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::write));
+    else if (r == (SSH_READ_PENDING | SSH_WRITE_PENDING))
+    {
+      auto v = co_await boost::capy::when_all(
+        socket_->wait(boost::corosio::wait_type::read),
+        socket_->wait(boost::corosio::wait_type::write)
+      );
+      ec = get<0>(v);
+    }
+    else
+      ec = std::make_error_code(std::errc::not_connected);
+
+    if (ec)
+      co_return ec;
+  }
+}
+
+boost::capy::io_task<int> session::listen_forward(const char * address, int port)
+{
+  int bound_port = 0;
+  for (;;)
+  {
+    auto rc = ssh_channel_listen_forward(session_.get(), address, port, &bound_port);
+    if (rc == SSH_OK)
+      co_return {{}, bound_port};
+    if (rc == SSH_ERROR)
+      co_return {std::error_code(ssh_get_error_code(session_.get()), ssh_category()), 0};
+
+    std::error_code ec;
+    auto r = ssh_get_poll_flags(session_.get());
+    if (r == SSH_READ_PENDING)
+      ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
+    else if (r == SSH_WRITE_PENDING)
+      ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::write));
+    else if (r == (SSH_READ_PENDING | SSH_WRITE_PENDING))
+    {
+      auto v = co_await boost::capy::when_all(
+        socket_->wait(boost::corosio::wait_type::read),
+        socket_->wait(boost::corosio::wait_type::write)
+      );
+      ec = get<0>(v);
+    }
+    else
+      ec = std::make_error_code(std::errc::not_connected);
+
+    if (ec)
+      co_return {ec, 0};
+  }
+}
+
+boost::capy::io_task<> session::cancel_forward(const char * address, int port)
+{
+  return do_op_(
+    [this, address, port]
+    {
+      return ssh_channel_cancel_forward(session_.get(), address, port);
+    }
+    );
+}
+
 std::string session::userauth_publickey_auto_get_current_identity()
 {
   char * value = nullptr;

@@ -59,18 +59,20 @@ try {
       co_return ec ? 1 : 0;
     }
 
-    
+    if (auto [ec] = co_await c.request_exec("ls"); ec)
+    {
+      std::cerr << "Error requesting exec: " << ec << " : " << ec.message() << std::endl; 
+      co_return ec ? 1 : 0;
+    }    
 
     std::string buffer;
     buffer.resize(4096);
     auto res = co_await c.read(boost::capy::make_buffer(buffer));
     const auto & [ec, n] = res;
+    printf("N %ld\n", n);
     std::string_view s{buffer.data(), n};
     std::cout << "Input: '" << s << "'" << std::endl;
   }
-
-  
-
   
   co_return 0;
 

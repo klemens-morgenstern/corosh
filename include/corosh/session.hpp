@@ -94,6 +94,9 @@ struct session
 
   unsigned int userauth_list();
 
+  boost::capy::io_task<int> listen_forward(const char * address, int port);
+  boost::capy::io_task<>    cancel_forward(const char * address, int port);
+
   std::string userauth_publickey_auto_get_current_identity();
 
   const char * userauth_kbdint_getinstruction() noexcept;
@@ -118,6 +121,9 @@ struct session
 
   template<typename AuthFunction>
   boost::capy::io_task<ssh_auth_e> do_auth_(AuthFunction);
+
+  template<typename Function>
+  boost::capy::io_task<> do_op_(Function f);
 };
 
 }
