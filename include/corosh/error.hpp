@@ -2,13 +2,14 @@
 
 
 #include <libssh/libssh.h>
+#include <libssh/sftp.h>
 #include <system_error>
 
 namespace corosh
 {
 
 std::error_category & ssh_category();
-
+std::error_category & sftp_category();
 
 }
 

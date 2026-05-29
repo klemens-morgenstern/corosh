@@ -32,6 +32,7 @@ add_library(corosh
     src/channel.cpp
     src/error.cpp
     src/session.cpp
+    src/sftp.cpp
 )
 
 

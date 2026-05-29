@@ -1,9 +1,10 @@
 #include <corosh/session.hpp>
+#include <corosh/sftp.hpp>
 
 #include <boost/corosio.hpp>
 #include <boost/capy.hpp>
 
-#include <libs/corosio/include/boost/corosio/endpoint.hpp>
+#include <boost/corosio/endpoint.hpp>
 #include <libssh/libssh.h>
 
 #include <iostream>
@@ -59,19 +60,26 @@ try {
       co_return ec ? 1 : 0;
     }
 
-    if (auto [ec] = co_await c.request_exec("ls"); ec)
+    if (auto [ec] = co_await c.request_sftp(); ec)
     {
       std::cerr << "Error requesting exec: " << ec << " : " << ec.message() << std::endl; 
       co_return ec ? 1 : 0;
     }    
 
-    std::string buffer;
-    buffer.resize(4096);
-    auto res = co_await c.read(boost::capy::make_buffer(buffer));
-    const auto & [ec, n] = res;
-    printf("N %ld\n", n);
-    std::string_view s{buffer.data(), n};
-    std::cout << "Input: '" << s << "'" << std::endl;
+    auto [ec, s] = co_await corosh::sftp::init(std::move(c));
+
+    if (ec)
+    {
+      std::cerr << "Error initializing sftp: " << ec << " : " << ec.message() << std::endl; 
+      co_return ec ? 1 : 0;
+    }
+
+    ec = (co_await s.unlink("~/bar")).ec;
+    if (ec)
+    {
+      std::cerr << "Error unlinking sftp: " << ec << " : " << ec.message() << std::endl; 
+      co_return ec ? 1 : 0;
+    }
   }
   
   co_return 0;
@@ -94,7 +102,7 @@ int main()
     
   ctx.run();
 
-  std::cout << "Ran "  << std::endl; 
+  std::cout << "Ran test client"  << std::endl; 
 
   return res;
 }

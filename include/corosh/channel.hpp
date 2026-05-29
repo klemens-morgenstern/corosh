@@ -109,7 +109,7 @@ struct channel
     if (boost::capy::buffer_size(buffer) == 0u)
       return []() -> boost::capy::io_task<std::size_t> {co_return {{}, 0u};}();
 
-    boost::capy::mutable_buffer b = *std::begin(buffer);
+    boost::capy::const_buffer b = *std::begin(buffer);
     return write_some(b, is_stderr);
   }
   boost::capy::io_task<std::size_t> write_some(boost::capy::const_buffer buffer, bool is_stderr);
