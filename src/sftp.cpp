@@ -955,6 +955,66 @@ boost::capy::io_task<dir> session::opendir(std::string_view path)
 }
 
 
+boost::capy::io_task<file> session::open(std::string_view path, int accesstype, mode_t mode)
+{
+  auto id = response_queue_.get_request_id();
+
+  ssh_fxp_handle_response response(id);
+  response_queue_.enqueue_response(response);
+
+  small_buffer<1024> b;
+
+  /* REQUEST:
+      uint8      type=SSH_FXP_OPEN
+      uint32     id
+      string     filename
+      uint32     pflags
+      ATTRS      attrs (PERMISSIONS=mode)
+  */
+  const auto attrs_len = 4u + 4u; // flags + permissions
+  const auto length    = 1 + 4 + (4 + path.size()) + 4 + attrs_len;
+
+  auto buf = b.get(4 + length);
+  boost::capy::const_buffer to_write = buf;
+
+  std::error_code ec;
+
+  put_u32(buf, length,                                  ec);
+  put_u8 (buf, SSH_FXP_OPEN,                            ec);
+  put_u32(buf, id,                                      ec);
+  put_str(buf, path,                                    ec);
+  put_u32(buf, static_cast<std::uint32_t>(accesstype),  ec);
+  put_u32(buf, SSH_FILEXFER_ATTR_PERMISSIONS,           ec);
+  put_u32(buf, static_cast<std::uint32_t>(mode),        ec);
+
+  ec = (co_await read_mutex_.lock()).ec;
+  if (ec)
+    co_return {ec, file{}};
+
+  ec = (co_await boost::capy::write(stream_, to_write)).ec;
+  read_mutex_.unlock();
+  if (ec)
+    co_return {ec, file{}};
+
+  while (!ec && !response.completed)
+  {
+      ec = (co_await write_mutex_.lock()).ec;
+      if (ec)
+        co_return {ec, file{}};
+
+      if (!response.completed)
+        ec = (co_await read_one_()).ec;
+
+      write_mutex_.unlock();
+  }
+
+  if (response.ec)
+    co_return {response.ec, file{}};
+
+  co_return {{}, file(this, std::move(response.handle))};
+}
+
+
 struct ssh_fxp_dir_entry_response final : detail::response
 {
   ssh_fxp_dir_entry_response(std::uint32_t id, std::vector<dir::entry> & entries_) : entries_(entries_)
@@ -1118,6 +1178,227 @@ boost::capy::io_task<> dir::close()
   handle_.clear();
 
   co_return response.ec;
+}
+
+
+boost::capy::io_task<> file::close()
+{
+  if (!sess_)
+    co_return {};
+
+  auto id = sess_->response_queue_.get_request_id();
+
+  ssh_fxp_status_response response(id);
+  sess_->response_queue_.enqueue_response(response);
+
+  small_buffer<1024> b;
+
+  /* REQUEST:
+      uint8      type=SSH_FXP_CLOSE
+      uint32     id
+      string     handle
+  */
+  const auto length = 1 + 4 + (4 + handle_.size());
+
+  auto buf = b.get(4 + length);
+  boost::capy::const_buffer to_write = buf;
+
+  std::error_code ec;
+
+  put_u32(buf, length,         ec);
+  put_u8 (buf, SSH_FXP_CLOSE,  ec);
+  put_u32(buf, id,             ec);
+  put_str(buf, handle_,        ec);
+
+  ec = (co_await sess_->read_mutex_.lock()).ec;
+  if (ec)
+    co_return ec;
+
+  ec = (co_await boost::capy::write(sess_->stream_, to_write)).ec;
+  sess_->read_mutex_.unlock();
+  if (ec)
+    co_return ec;
+
+  while (!ec && !response.completed)
+  {
+      ec = (co_await sess_->write_mutex_.lock()).ec;
+      if (ec)
+        co_return ec;
+
+      if (!response.completed)
+        ec = (co_await sess_->read_one_()).ec;
+
+      sess_->write_mutex_.unlock();
+  }
+
+  // After close completes (or fails), the handle is no longer valid.
+  sess_   = nullptr;
+  handle_.clear();
+
+  co_return response.ec;
+}
+
+
+struct ssh_fxp_data_response final : detail::response
+{
+  ssh_fxp_data_response(std::uint32_t id, boost::capy::mutable_buffer dest_)
+    : dest(dest_)
+  {
+      this->request_id = id;
+  }
+
+  void complete(std::error_code ec_, std::uint8_t type, boost::capy::const_buffer payload)
+  {
+    ec = ec_;
+
+    // SSH_FX_EOF is the normal end-of-file marker for read.
+    if (!ec && type == SSH_FXP_STATUS)
+    {
+      auto error = take_u32(payload, ec);
+      if (!ec)
+      {
+        if (error == SSH_FX_EOF)
+          ec = boost::capy::error::eof;
+        else if (error != SSH_FX_OK)
+          ec.assign(error, sftp_category());
+      }
+      completed = true;
+      return;
+    }
+
+    if (!ec && type != SSH_FXP_DATA)
+      ec.assign(SSH_FX_BAD_MESSAGE, sftp_category());
+
+    if (!ec)
+    {
+      auto data = take_str(payload, ec);
+      if (!ec)
+      {
+        n = std::min(data.size(), dest.size());
+        std::memcpy(dest.data(), data.data(), n);
+      }
+    }
+
+    completed = true;
+  }
+
+  bool                          completed = false;
+  std::error_code               ec;
+  boost::capy::mutable_buffer   dest;
+  std::size_t                   n = 0u;
+};
+
+
+boost::capy::io_task<std::size_t> file::read_some_at(std::uint64_t offset, boost::capy::mutable_buffer buffer)
+{
+  auto id = sess_->response_queue_.get_request_id();
+
+  ssh_fxp_data_response response(id, buffer);
+  sess_->response_queue_.enqueue_response(response);
+
+  small_buffer<1024> b;
+
+  /* REQUEST:
+      uint8      type=SSH_FXP_READ
+      uint32     id
+      string     handle
+      uint64     offset
+      uint32     len
+  */
+  const auto length = 1 + 4 + (4 + handle_.size()) + 8 + 4;
+
+  auto buf = b.get(4 + length);
+  boost::capy::const_buffer to_write = buf;
+
+  std::error_code ec;
+
+  put_u32(buf, length,                                   ec);
+  put_u8 (buf, SSH_FXP_READ,                             ec);
+  put_u32(buf, id,                                       ec);
+  put_str(buf, handle_,                                  ec);
+  put_u64(buf, offset,                                   ec);
+  put_u32(buf, static_cast<std::uint32_t>(buffer.size()), ec);
+
+  ec = (co_await sess_->read_mutex_.lock()).ec;
+  if (ec)
+    co_return {ec, 0u};
+
+  ec = (co_await boost::capy::write(sess_->stream_, to_write)).ec;
+  sess_->read_mutex_.unlock();
+  if (ec)
+    co_return {ec, 0u};
+
+  while (!ec && !response.completed)
+  {
+      ec = (co_await sess_->write_mutex_.lock()).ec;
+      if (ec)
+        co_return {ec, 0u};
+
+      if (!response.completed)
+        ec = (co_await sess_->read_one_()).ec;
+
+      sess_->write_mutex_.unlock();
+  }
+
+  co_return {response.ec, response.n};
+}
+
+
+boost::capy::io_task<std::size_t> file::write_some_at(std::uint64_t offset, boost::capy::const_buffer buffer)
+{
+  auto id = sess_->response_queue_.get_request_id();
+
+  ssh_fxp_status_response response(id);
+  sess_->response_queue_.enqueue_response(response);
+
+  small_buffer<1024> b;
+
+  /* REQUEST:
+      uint8      type=SSH_FXP_WRITE
+      uint32     id
+      string     handle
+      uint64     offset
+      string     data
+  */
+  const auto length = 1 + 4 + (4 + handle_.size()) + 8 + (4 + buffer.size());
+
+  auto buf = b.get(4 + length);
+  boost::capy::const_buffer to_write = buf;
+
+  std::error_code ec;
+
+  put_u32(buf, length,         ec);
+  put_u8 (buf, SSH_FXP_WRITE,  ec);
+  put_u32(buf, id,             ec);
+  put_str(buf, handle_,        ec);
+  put_u64(buf, offset,         ec);
+  put_str(buf,
+          std::string_view{static_cast<const char *>(buffer.data()), buffer.size()},
+          ec);
+
+  ec = (co_await sess_->read_mutex_.lock()).ec;
+  if (ec)
+    co_return {ec, 0u};
+
+  ec = (co_await boost::capy::write(sess_->stream_, to_write)).ec;
+  sess_->read_mutex_.unlock();
+  if (ec)
+    co_return {ec, 0u};
+
+  while (!ec && !response.completed)
+  {
+      ec = (co_await sess_->write_mutex_.lock()).ec;
+      if (ec)
+        co_return {ec, 0u};
+
+      if (!response.completed)
+        ec = (co_await sess_->read_one_()).ec;
+
+      sess_->write_mutex_.unlock();
+  }
+
+  // SFTP WRITE is all-or-nothing: success means every byte landed.
+  co_return {response.ec, response.ec ? std::size_t{0u} : buffer.size()};
 }
 
 

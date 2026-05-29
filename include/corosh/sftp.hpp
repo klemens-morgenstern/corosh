@@ -12,6 +12,7 @@
 #include <boost/corosio/tcp_socket.hpp>
 #include <boost/capy/io/any_read_source.hpp>
 #include <boost/capy/io/any_write_sink.hpp>
+#include <boost/capy/when_all.hpp>
 
 #include <coroutine>
 #include <libssh/libssh.h>
@@ -140,26 +141,66 @@ struct file
   file(file &&) noexcept = default;
   file & operator=(file &&) noexcept = default;
 
-  explicit operator bool() const noexcept { return file_ != nullptr; }
+  explicit operator bool() const noexcept { return sess_ != nullptr; }
 
-  template<boost::capy::MutableBufferSequence MB>
-  boost::capy::io_task<std::size_t> read_some(MB buffer);
-  boost::capy::io_task<std::size_t> read_some(boost::capy::mutable_buffer buffer);
+  const std::string & handle() const noexcept { return handle_; }
 
 
-  template<boost::capy::ConstBufferSequence CB>
-  boost::capy::io_task<std::size_t> write_some(CB buffer);
-  boost::capy::io_task<std::size_t> write_some(boost::capy::const_buffer buffer);
-
-
-  template<boost::capy::MutableBufferSequence MB>
-  boost::capy::io_task<std::size_t> read_some_at(std::uint64_t offset, MB buffer);
-  boost::capy::io_task<std::size_t> read_some_at(std::uint64_t offset, boost::capy::mutable_buffer buffer);
-
-
-  template<boost::capy::ConstBufferSequence CB>
-  boost::capy::io_task<std::size_t> write_some_at(std::uint64_t offset, CB buffer);
+  // sftp read all bytes until it encounters EOF
+  
+  boost::capy::io_task<std::size_t>  read_some_at(std::uint64_t offset, boost::capy::mutable_buffer buffer);
   boost::capy::io_task<std::size_t> write_some_at(std::uint64_t offset, boost::capy::const_buffer buffer);
+
+  template<boost::capy::MutableBufferSequence MB>
+    requires(!std::is_same_v<MB, boost::capy::mutable_buffer>)
+  boost::capy::io_task<std::size_t> read_some_at(std::uint64_t offset, MB mb)
+  {
+    std::vector<boost::capy::io_task<std::size_t>> tasks;
+
+    for (boost::capy::mutable_buffer buf : mb)
+    {
+      tasks.push_back(read_some_at(offset, buf));
+      offset += buf.size();
+    }
+
+    auto r = co_await boost::capy::when_all(std::move(tasks));
+    std::size_t n = 0u;
+    std::error_code ec;
+    for (const auto & [ec_, n_] : r)
+    {
+      n += n_;
+      if (ec_ && !ec)
+        ec = ec_;
+    }
+
+    co_return n;
+  }
+
+
+  template<boost::capy::ConstBufferSequence CB>
+    requires(!std::is_same_v<CB, boost::capy::const_buffer>)
+  boost::capy::io_task<std::size_t> write_some_at(std::uint64_t offset, CB mb)
+  {
+    std::vector<boost::capy::io_task<std::size_t>> tasks;
+
+    for (boost::capy::const_buffer buf : mb)
+    {
+      tasks.push_back(write_some_at(offset, buf));
+      offset += buf.size();
+    }
+
+    auto r = co_await boost::capy::when_all(std::move(tasks));
+    std::size_t n = 0u;
+    std::error_code ec;
+    for (const auto & [ec_, n_] : r)
+    {
+      n += n_;
+      if (ec_ && !ec)
+        ec = ec_;
+    }
+
+    co_return n;
+  }
 
   std::uint64_t seek(std::uint64_t offset);
   std::size_t size();
@@ -171,12 +212,10 @@ struct file
   boost::capy::execution_context & context();
 
  private:
-  friend struct sftp;
-  explicit file(::sftp_file f, std::shared_ptr<boost::corosio::tcp_socket> socket) noexcept : file_(f) {}
-
-  struct deleter { void operator()(::sftp_file f) const noexcept { if (f) sftp_close(f); } };
-  std::unique_ptr<std::remove_pointer_t<::sftp_file>, deleter> file_;
-  std::shared_ptr<boost::corosio::tcp_socket> socket_;
+  friend struct session;
+  file(session * s, std::string handle) : sess_(s), handle_(std::move(handle)) {}
+  session * sess_ = nullptr;
+  std::string handle_;
 };
 
 struct dir

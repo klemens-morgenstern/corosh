@@ -9,6 +9,7 @@
 #include <libssh/libssh.h>
 
 #include <iostream>
+#include <sys/types.h>
 #include <unistd.h>
 
 
@@ -87,7 +88,7 @@ try {
     auto [ec_dir, dir_it] = co_await s.opendir(h);
     if (ec_dir)
     {
-      std::cerr << "open failed: " << ec_dir << std::endl;
+      std::cerr << "opendir failed: " << ec_dir << std::endl;
       co_return 1;
     }
 
@@ -106,11 +107,26 @@ try {
     }
 
     std::ignore = co_await dir_it.close();
-  }
-  
-  co_return 0;
 
-  
+    auto [ec_f, f] = co_await s.open(h + "/.bash_history", SSH_FXF_READ, 0);
+    if (ec_f)
+    {
+      std::cerr << "open failed [" << h << "]: " << ec_f  << " - " << ec_f.message() << std::endl;
+      co_return 1;
+    }
+
+    char buffer[256];
+
+    auto [ecr, r] = co_await f.read_some_at(0, boost::capy::make_buffer(buffer));
+
+    if (ecr)
+      std::cerr << "read failed :" << ecr  << " - " << ecr.message() << std::endl;
+    else
+      std::cout << std::string_view(buffer, r) << std::endl;
+
+    std::ignore = co_await f.close();
+  }
+  co_return 0;  
 }
 catch (std::exception & e)
 {
