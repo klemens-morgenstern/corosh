@@ -1,3 +1,4 @@
+#include <chrono>
 #include <corosh/channel.hpp>
 #include <corosh/session.hpp>
 
@@ -310,8 +311,6 @@ boost::capy::io_task<exit_state> channel::get_exit_state()
       );
       ec = get<0>(v);
     }
-    else
-      ec = std::make_error_code(std::errc::not_connected);
 
     if (ec)
       co_return {ec, {}};
@@ -348,7 +347,13 @@ boost::capy::io_task<std::size_t> channel::do_some_io_(Function f)
 
     auto r = ssh_get_poll_flags(s);
     if (r == SSH_READ_PENDING)
-      ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
+    {
+      boost::corosio::timer t{socket_->context()};
+      t.expires_after(std::chrono::milliseconds(10));
+      ec = (co_await t.wait()).ec;
+      
+      //ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
+    }
     else if (r == SSH_WRITE_PENDING)
       ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::write));
     else if (r == (SSH_READ_PENDING | SSH_WRITE_PENDING))
@@ -359,9 +364,7 @@ boost::capy::io_task<std::size_t> channel::do_some_io_(Function f)
       );
      ec = get<0>(v);
     }
-    else
-      ec = std::make_error_code(std::errc::not_connected);
-      
+    
     if (ec)
       co_return {ec, 0ull};
   }  
@@ -397,8 +400,6 @@ boost::capy::io_task<std::size_t> channel::do_io_(Function f)
       );
      ec = get<0>(v);
     }
-    else
-      ec = std::make_error_code(std::errc::not_connected);
       
     if (ec)
       co_return {ec, 0ull};
@@ -412,7 +413,7 @@ boost::capy::io_task<std::size_t> channel::read_some(
   return do_some_io_(
     [this, buffer, is_stderr]
     {
-        return ssh_channel_read(channel_.get(), buffer.data(), buffer.size(), is_stderr ? 1 : 0);;
+      return ssh_channel_read_timeout(channel_.get(), buffer.data(), buffer.size(), is_stderr ? 1 : 0, 0);
     }
   );
 }
@@ -424,7 +425,7 @@ boost::capy::io_task<std::size_t> channel::read(
   return do_io_(
       [this, buffer, is_stderr, m = 0]() mutable
       {
-        auto n = ssh_channel_read(channel_.get(), buffer.data(), buffer.size(), is_stderr ? 1 : 0);
+        auto n = ssh_channel_read_timeout(channel_.get(), buffer.data(), buffer.size(), is_stderr ? 1 : 0, 0);
 
         if (n < 0)
           return n;

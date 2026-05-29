@@ -1,3 +1,4 @@
+#include "corosh/error.hpp"
 #include <corosh/session.hpp>
 #include <corosh/sftp.hpp>
 
@@ -22,7 +23,7 @@ try {
   corosh::session ses{co_await capy::this_coro::executor};
 
   ses.set_option(corosh::options::host("localhost"));
-  ses.set_option(corosh::options::log_verbosity(SSH_LOG_PACKET));
+  ses.set_option(corosh::options::log_verbosity(SSH_LOG_TRACE));
   ses.set_option(corosh::options::port(22));
   ses.set_option(corosh::options::user("klemens"));
   
@@ -74,12 +75,37 @@ try {
       co_return ec ? 1 : 0;
     }
 
-    ec = (co_await s.unlink("~/bar")).ec;
-    if (ec)
+    auto [ec_h, h] = co_await s.home_directory("klemens");
+    if (ec_h)
     {
-      std::cerr << "Error unlinking sftp: " << ec << " : " << ec.message() << std::endl; 
-      co_return ec ? 1 : 0;
+      std::cerr << "Error getting home directory sftp: " << ec_h << " : " << ec.message() << std::endl; 
+      co_return ec_h ? 1 : 0;
     }
+
+    std::cout << "Home folder: " << h << std::endl;
+
+    auto [ec_dir, dir_it] = co_await s.opendir(h);
+    if (ec_dir)
+    {
+      std::cerr << "open failed: " << ec_dir << std::endl;
+      co_return 1;
+    }
+
+    while (true)
+    {
+      auto [ec, e] = co_await dir_it.read();
+      auto [attr, name, long_name] = e;
+      if (ec)
+      {
+        if (ec != std::error_code(SSH_FX_EOF, corosh::sftp_category()))
+          std::cerr << "Error reading directory: " << ec.message() << std::endl;
+        break;
+      }
+
+      std::cout << name << " :: " << long_name << std::endl;      
+    }
+
+    std::ignore = co_await dir_it.close();
   }
   
   co_return 0;

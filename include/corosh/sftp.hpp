@@ -13,6 +13,7 @@
 #include <boost/capy/io/any_read_source.hpp>
 #include <boost/capy/io/any_write_sink.hpp>
 
+#include <coroutine>
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 
@@ -25,6 +26,8 @@
 
 namespace corosh::sftp
 {
+
+struct session;
 
 namespace detail
 {
@@ -82,6 +85,9 @@ struct response_queue
       {
         if (it->prev != nullptr)
           it->prev->next = it->next;
+        else
+          if (it == last)
+            last = nullptr;
 
         it->complete(ec, type, buf);
         return true;
@@ -106,9 +112,28 @@ struct response_queue
 
 }
 
-struct sftp_attributs_deleter {void operator()(::sftp_attributes a) const noexcept { sftp_attributes_free(a); } };
-using attributes = std::unique_ptr<std::remove_pointer_t<sftp_attributes>, sftp_attributs_deleter>;
+struct attributes
+{
+  std::uint32_t flags               = 0u;
+  std::uint8_t  type                = 0u;
+  std::uint64_t size                = 0u;
+  std::uint32_t uid                 = 0u;
+  std::uint32_t gid                 = 0u;
+  std::string   owner;
+  std::string   group;
+  std::uint32_t permissions         = 0u;
+  std::uint64_t atime64             = 0u;
+  std::uint32_t atime               = 0u;
+  std::uint32_t atime_nseconds      = 0u;
+  std::uint64_t createtime          = 0u;
+  std::uint32_t createtime_nseconds = 0u;
+  std::uint64_t mtime64             = 0u;
+  std::uint32_t mtime               = 0u;
+  std::uint32_t mtime_nseconds      = 0u;
+  std::string   acl;
+};
 
+struct session;
 struct file
 {
   file() noexcept = default;
@@ -139,7 +164,7 @@ struct file
   std::uint64_t seek(std::uint64_t offset);
   std::size_t size();
 
-  boost::capy::io_task<sftp_attributes> fstat();
+  boost::capy::io_task<attributes> fstat();
   boost::capy::io_task<> fsync();
   boost::capy::io_task<> close();
 
@@ -154,28 +179,80 @@ struct file
   std::shared_ptr<boost::corosio::tcp_socket> socket_;
 };
 
-struct sftp_dir
+struct dir
 {
-  sftp_dir() noexcept = default;
-  sftp_dir(sftp_dir &&) noexcept = default;
-  sftp_dir & operator=(sftp_dir &&) noexcept = default;
+  dir() noexcept = default;
+  dir(dir &&) noexcept = default;
+  dir & operator=(dir &&) noexcept = default;
+  ~dir() = default;
 
-  explicit operator bool() const noexcept { return dir_ != nullptr; }
+  struct entry
+  {
+    attributes attr;
+    std::string name;
+    std::string long_name;
+  };
+
+  explicit operator bool() const noexcept { return sess_ != nullptr; }
+
+  struct read_op
+  {
+    bool await_ready()  noexcept
+    { 
+      if (dir_.buffer_.empty() || dir_.eof_)  
+        return task_.emplace(dir_.do_read_()).await_ready();
+      else
+        return true;
+    }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> h, const boost::capy::io_env * env)
+    {
+      return task_->await_suspend(h, env);
+    }
+
+    boost::capy::io_result<entry> await_resume() 
+    {
+      std::error_code ec;
+      if (task_)
+        ec = task_->await_resume().ec;
+      else if (dir_.eof_)
+        ec = boost::capy::error::eof;
+
+      entry e;
+      if (!dir_.buffer_.empty())
+      {
+        e = std::move(dir_.buffer_.front());
+        dir_.buffer_.erase(dir_.buffer_.begin());
+      }
+
+      return {ec, e};
+    }
+    read_op(dir & dir_) : dir_(dir_) {}
+   private:
+    dir & dir_;
+    std::optional<boost::capy::io_task<>> task_;
+  };
+
   
-  bool eof() const { return dir_ ? sftp_dir_eof(dir_.get()) != 0 : true; }
-
-  boost::capy::task<attributes> readdir();
+  read_op read() { return read_op(*this); }
   boost::capy::io_task<> close();
 
   boost::capy::execution_context & context();
 
- private:
-  friend struct sftp;
-  explicit sftp_dir(::sftp_dir d, std::shared_ptr<boost::corosio::tcp_socket> socket) noexcept : dir_(d) {}
+  const std::string & handle() {return handle_;}
 
-  struct deleter { void operator()(::sftp_dir d) const noexcept { if (d) sftp_closedir(d); } };
-  std::unique_ptr<std::remove_pointer_t<::sftp_dir>, deleter> dir_;
-  std::shared_ptr<boost::corosio::tcp_socket> socket_;
+
+  
+ private:
+  boost::capy::io_task<> do_read_();
+
+ 
+  friend struct session;
+  dir(session * s, std::string handle) : sess_(s), handle_(std::move(handle)) {}
+  session * sess_ = nullptr;
+  std::string handle_;
+  std::vector<entry> buffer_;
+  bool eof_ = false;
 };
 
 struct session
@@ -211,21 +288,21 @@ struct session
 
   std::uint32_t server_version() const { return server_version_; }
 
-  boost::capy::io_task<file>       open   (std::string_view path, int accesstype, mode_t mode);
-  boost::capy::io_task<sftp_dir>   opendir(std::string_view path);
+  boost::capy::io_task<file>  open   (std::string_view path, int accesstype, mode_t mode);
+  boost::capy::io_task<dir>   opendir(std::string_view path);
 
-  boost::capy::io_task<sftp_attributes> stat (std::string_view path);
-  boost::capy::io_task<sftp_attributes> lstat(std::string_view path);
+  boost::capy::io_task<attributes> stat (std::string_view path);
+  boost::capy::io_task<attributes> lstat(std::string_view path);
 
   boost::capy::io_task<> unlink  (std::string_view path);
   boost::capy::io_task<> mkdir   (std::string_view path, mode_t mode);
   boost::capy::io_task<> rmdir   (std::string_view path);
-  boost::capy::io_task<> rename  (std::string_view original, const char * newname);
+  boost::capy::io_task<> rename  (std::string_view original, std::string_view newname);
   boost::capy::io_task<> chmod   (std::string_view path, mode_t mode);
   boost::capy::io_task<> chown   (std::string_view path, uid_t owner, gid_t group);
   boost::capy::io_task<> symlink (std::string_view target,  std::string_view dest);
   boost::capy::io_task<> hardlink(std::string_view oldpath, std::string_view newpath);
-  boost::capy::io_task<> setstat (std::string_view path, sftp_attributes attr);
+  boost::capy::io_task<> setstat (std::string_view path, const attributes & attr);
 
   boost::capy::io_task<std::string> readlink(std::string_view path);
   boost::capy::io_task<std::string> canonicalize_path(std::string_view path);
@@ -243,6 +320,9 @@ struct session
 
   boost::capy::async_mutex write_mutex_, read_mutex_;
   boost::capy::io_task<> read_one_();
+
+  friend struct dir;
+  friend struct file;
 
 };
 
