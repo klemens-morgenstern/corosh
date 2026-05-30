@@ -10,11 +10,17 @@
 #include <boost/capy/read_until.hpp>
 #include <boost/capy/write.hpp>
 
-#include <libs/capy/include/boost/capy/buffers/string_dynamic_buffer.hpp>
+#include <boost/capy/ex/async_event.hpp>
+#include <boost/capy/buffers/string_dynamic_buffer.hpp>
+#include <boost/capy/ex/this_coro.hpp>
+#include <boost/capy/ex/run_async.hpp>
+#include <boost/capy/when_any.hpp>
+
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 
 
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 
@@ -242,8 +248,6 @@ boost::capy::io_task<session> init(boost::capy::any_stream stream)
 
   std::vector<unsigned char> buffer;
   
-
-  
   auto rbuf = boost::capy::dynamic_buffer(buffer);
   res = co_await boost::capy::read_until(stream, rbuf, &match_packet);
   if (ec)
@@ -251,7 +255,6 @@ boost::capy::io_task<session> init(boost::capy::any_stream stream)
 
 
   const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(buffer.data())); 
-
   auto cb = boost::capy::make_buffer(rbuf.data(), sz + 4u);
   
   cb += 4u; // remove the size
@@ -308,15 +311,14 @@ boost::capy::io_task<> session::read_one_()
     response_queue_.cancel_all(ec);
     co_return ec;
   }
-
   
       
   const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(buf.data().data())); 
   auto buffer = boost::capy::make_buffer(buf.data(), sz + 4u);
   buffer += 4u; // next read the request_id
 
-  auto tp = take_u8(buffer, ec);
-  auto request_id = take_u32(buffer, ec);
+  const auto tp = take_u8(buffer, ec);
+  const auto request_id = take_u32(buffer, ec);
 
   if (ec)
     co_return ec;
@@ -1805,6 +1807,628 @@ boost::capy::io_task<std::string> session::home_directory(std::string_view usern
   }
 
   co_return {response.ec, std::move(response.name)};
+}
+
+
+namespace {
+
+
+
+boost::capy::const_buffer build_status(
+    std::vector<unsigned char> & buffer,
+    std::uint32_t request_id,
+    const std::error_code reported_ec,
+    std::error_code &ec)
+{
+  auto msg = reported_ec.message();
+  const std::uint32_t body_len = 1u + 4u + 4u
+                               + 4u + static_cast<std::uint32_t>(msg.size())
+                               + 4u; // empty language tag
+  buffer.resize(4u + body_len);
+  auto buf = boost::capy::make_buffer(buffer);
+
+  std::uint32_t status;
+  if (reported_ec.category() == sftp_category() || !reported_ec)
+    status = reported_ec.value();
+  else if (reported_ec == boost::capy::cond::eof)
+    status = SSH_FX_EOF;
+  else if (reported_ec == boost::capy::cond::not_found)
+    status = SSH_FX_NO_SUCH_PATH;
+  else if (reported_ec == std::errc::not_connected)
+    status = SSH_FX_NO_CONNECTION;
+  else if (reported_ec == std::errc::no_such_file_or_directory)
+    status = SSH_FX_NO_SUCH_FILE;
+  else if (reported_ec == std::errc::permission_denied)
+    status = SSH_FX_PERMISSION_DENIED;
+  else if (reported_ec == std::errc::bad_message)
+    status = SSH_FX_BAD_MESSAGE;
+  else if (reported_ec == std::errc::connection_aborted
+        || reported_ec == std::errc::connection_reset)
+    status = SSH_FX_CONNECTION_LOST;
+  else if (reported_ec == std::errc::operation_not_supported
+        || reported_ec == std::errc::function_not_supported)
+    status = SSH_FX_OP_UNSUPPORTED;
+  else if (reported_ec == std::errc::bad_file_descriptor)
+    status = SSH_FX_INVALID_HANDLE;
+  else if (reported_ec == std::errc::file_exists)
+    status = SSH_FX_FILE_ALREADY_EXISTS;
+  else if (reported_ec == std::errc::read_only_file_system)
+    status = SSH_FX_WRITE_PROTECT;
+  else if (reported_ec == std::errc::no_such_device
+        || reported_ec == std::errc::no_such_device_or_address)
+    status = SSH_FX_NO_MEDIA;
+  else
+    status = SSH_FX_FAILURE;
+  
+
+                       
+
+  put_u32(buf, body_len,        ec);
+  put_u8 (buf, SSH_FXP_STATUS,  ec);
+  put_u32(buf, request_id,      ec);
+  put_u32(buf, status,          ec);
+  put_str(buf, msg,             ec);
+  put_str(buf, std::string_view{}, ec);
+
+  return boost::capy::make_buffer(buffer);
+}
+
+
+} // namespace
+
+
+
+static boost::capy::io_task<> init_server(boost::capy::any_stream stream)
+{
+ std::unordered_map<std::string, std::string> extensions = {
+                                {"hardlink@openssh.com", "1"},
+                                {"expand-path@openssh.com", "1"}
+                              };
+
+
+  // 1) Read the SSH_FXP_INIT packet from the client.
+  std::vector<unsigned char> buffer;
+  auto rbuf = boost::capy::dynamic_buffer(buffer);
+
+  auto res = co_await boost::capy::read_until(stream, rbuf, &match_packet);
+  auto & [ec, n] = res;
+  if (ec)
+    co_return ec;
+
+  {
+    const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(buffer.data()));
+    auto cb = boost::capy::make_buffer(rbuf.data(), sz + 4u);
+    cb += 4u;
+
+    auto type           = take_u8 (cb, ec);
+    auto client_version = take_u32(cb, ec);
+    (void)client_version;
+
+    if (!ec && type != SSH_FXP_INIT)
+      ec.assign(SSH_FATAL, ssh_category());
+
+    rbuf.consume(sz + 4u);
+    if (ec) co_return ec;
+  }
+
+  // 2) Build and send the SSH_FXP_VERSION response.
+  {
+    std::size_t ext_bytes = 0;
+    for (auto const & [name, data] : extensions)
+      ext_bytes += 4u + name.size() + 4u + data.size();
+
+    const std::uint32_t body_len = 1u + 4u + static_cast<std::uint32_t>(ext_bytes);
+    std::vector<unsigned char> out(4u + body_len);
+    auto wbuf = boost::capy::make_buffer(out.data(), out.size());
+
+    put_u32(wbuf, body_len,         ec);
+    put_u8 (wbuf, SSH_FXP_VERSION,  ec);
+    put_u32(wbuf, LIBSFTP_VERSION,  ec);
+    for (auto const & [name, data] : extensions)
+    {
+      put_str(wbuf, name, ec);
+      put_str(wbuf, data, ec);
+    }
+    if (ec) co_return ec;
+
+    ec = get<0>(co_await boost::capy::write(stream,
+        boost::capy::make_buffer(out.data(), out.size())));
+    if (ec) co_return ec;
+  }
+
+  co_return {};
+}
+
+
+boost::capy::io_task<> serve_worker(
+    boost::capy::any_stream & stream, 
+    server & s,
+    std::vector<unsigned char> & buffer,
+    boost::capy::async_mutex &read_mutex,
+    boost::capy::async_mutex &write_mutex)
+{
+  std::vector<unsigned char> my_buffer;
+
+  while (!(co_await boost::capy::this_coro::stop_token).stop_requested())
+  {
+    my_buffer.clear();
+    boost::capy::const_buffer cb;
+        
+    {
+      auto lock = co_await read_mutex.scoped_lock();
+      if (lock.ec)
+        co_return lock.ec;
+
+      my_buffer.assign(buffer.begin(), buffer.end());
+
+      auto rbuf = boost::capy::dynamic_buffer(my_buffer);
+      auto res = co_await boost::capy::read_until(stream, rbuf, &match_packet);
+      if (res.ec)
+          co_return res.ec;
+
+      // the packet size. we read at least sz + 4u
+      const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(buffer.data())); 
+
+      // assign whatever is left to the shared buffer
+      buffer.assign(my_buffer.begin() + sz + 4u, my_buffer.end());
+      cb = boost::capy::make_buffer(rbuf.data(), sz + 4u);
+      cb += 4u; // remove the size
+    }
+
+    std::error_code ec;
+    // 
+    const auto tp = take_u8(cb, ec);
+    const auto request_id  = take_u32(cb, ec);
+
+    boost::capy::const_buffer response;
+
+    switch (tp)
+    {
+      case SSH_FXP_OPEN:
+      {
+        boost::capy::io_result<std::string>  r;
+        const auto fn = take_str(cb, r.ec);
+        const auto pflags = take_u32(cb, r.ec);
+        const auto attrs = take_attrs(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.open(fn, pflags, attrs.permissions);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & h = get<1>(r);
+          const auto res_size = 1u + 4u + (4u +  h.size());
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size, ec); // size
+          put_u8(mb, SSH_FXP_HANDLE, ec);
+          put_u32(mb, request_id, ec);
+          put_str(mb, h, ec); // handle
+          response = boost::capy::make_buffer(my_buffer);
+        }
+      } break;
+      case SSH_FXP_CLOSE:
+      {
+        boost::capy::io_result<> r;
+        const auto handle = take_str(cb, r.ec);
+        
+        if (!r.ec)
+          r = co_await s.close(handle);
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+      case SSH_FXP_READ:
+      {
+        boost::capy::io_result<std::size_t> r;
+        const auto handle = take_str(cb, r.ec);
+        const auto offset = take_u64(cb, r.ec);
+        const auto len    = take_u32(cb, r.ec);
+
+        if (len > 1024*1024*1024) // limit it at 1 MB
+          r.ec.assign(SSH_FX_BAD_MESSAGE, sftp_category());
+        
+        // prealloc the whole thing
+        auto res_size = 1u + 4u + (4u + len);
+        if (!r.ec) // void user induced OOM
+          my_buffer.resize(res_size + 4u);
+
+        auto mb = boost::capy::make_buffer(my_buffer);
+        mb += 4u + 1u + 4u + 4u; // skip to the data
+        if (!r.ec) 
+          r = co_await s.read_at(handle, offset, mb);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto actual_len = get<1>(r);
+          if (actual_len < len)
+          {
+            res_size -= (len - actual_len);
+            my_buffer.resize(res_size + 4u);
+          }
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size, ec);
+          put_u8(mb, SSH_FXP_DATA, ec);
+          put_u32(mb, request_id, ec);
+          put_u32(mb, actual_len, ec);
+          response = boost::capy::make_buffer(mb);
+        }
+      } break;
+      case SSH_FXP_WRITE:
+      {
+        boost::capy::io_result<std::size_t> r;
+        const auto handle = take_str(cb, r.ec);
+        const auto offset = take_u64(cb, r.ec);
+        const auto data   = take_str(cb, r.ec);
+
+        if (data.size() > 1024*1024*1024) // limit it at 1MB
+          r.ec.assign(SSH_FX_BAD_MESSAGE, sftp_category());
+
+        if (!r.ec)
+          r = co_await s.write_at(handle, offset,
+                  boost::capy::make_buffer(data.data(), data.size()));
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+      } break;
+      case SSH_FXP_LSTAT:
+      {
+        boost::capy::io_result<attributes> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.lstat(path);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & attr = get<1>(r);
+          const auto res_size = 1u + 4u + static_cast<std::uint32_t>(attrs_length(attr));
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32  (mb, res_size,     ec);
+          put_u8   (mb, SSH_FXP_ATTRS, ec);
+          put_u32  (mb, request_id,   ec);
+          put_attrs(mb, attr,         ec);
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        
+      } break;
+
+      case SSH_FXP_FSTAT:
+      {
+        boost::capy::io_result<attributes> r;
+        const auto handle = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.fstat(handle);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & attr = get<1>(r);
+          const auto res_size = 1u + 4u + static_cast<std::uint32_t>(attrs_length(attr));
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32  (mb, res_size,     ec);
+          put_u8   (mb, SSH_FXP_ATTRS, ec);
+          put_u32  (mb, request_id,   ec);
+          put_attrs(mb, attr,         ec);
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        
+      } break;
+
+      case SSH_FXP_SETSTAT:
+      {
+        boost::capy::io_result<> r;
+        const auto path = take_str(cb, r.ec);
+        const auto attr = take_attrs(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.setstat(path, attr);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        
+      } break;
+
+      case SSH_FXP_FSETSTAT:
+      {
+        boost::capy::io_result<> r;
+        const auto handle = take_str(cb, r.ec);
+        const auto attr   = take_attrs(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.fsetstat(handle, attr);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        
+      } break;
+      case SSH_FXP_OPENDIR:
+      {
+        boost::capy::io_result<std::string> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.opendir(path);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & h = get<1>(r);
+          const auto res_size = 1u + 4u + (4u + h.size());
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size,         ec); // size
+          put_u8 (mb, SSH_FXP_HANDLE,   ec);
+          put_u32(mb, request_id,       ec);
+          put_str(mb, h,                ec); // handle
+          response = boost::capy::make_buffer(my_buffer);
+        } 
+      } break;
+      case SSH_FXP_REMOVE:
+      {
+        boost::capy::io_result<> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.unlink(path);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+
+      case SSH_FXP_MKDIR:
+      {
+        boost::capy::io_result<> r;
+        const auto path = take_str(cb, r.ec);
+        const auto attr = take_attrs(cb, r.ec);
+
+        const mode_t mode = (attr.flags & SSH_FILEXFER_ATTR_PERMISSIONS)
+                            ? attr.permissions : mode_t{0755};
+
+        if (!r.ec)
+          r = co_await s.mkdir(path, mode);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+
+      case SSH_FXP_RMDIR:
+      {
+        boost::capy::io_result<> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.rmdir(path);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+
+      case SSH_FXP_REALPATH:
+      {
+        boost::capy::io_result<std::string> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.canonicalize_path(path);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & name = get<1>(r);
+          // SSH_FXP_NAME: type(1) + id(4) + count(4) + string(4+name)
+          //               + empty longname(4) + empty attrs(4 flags)
+          const auto res_size = 1u + 4u + 4u
+                              + 4u + static_cast<std::uint32_t>(name.size())
+                              + 4u   // empty longname
+                              + 4u;  // attrs.flags = 0
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size,             ec);
+          put_u8 (mb, SSH_FXP_NAME,         ec);
+          put_u32(mb, request_id,           ec);
+          put_u32(mb, 1u,                   ec); // count
+          put_str(mb, name,                 ec);
+          put_str(mb, std::string_view{},   ec); // empty longname
+          put_u32(mb, 0u,                   ec); // attrs.flags = 0
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        break;
+      }
+
+      case SSH_FXP_STAT:
+      {
+        boost::capy::io_result<attributes> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.stat(path);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & attr = get<1>(r);
+          const auto res_size = 1u + 4u + static_cast<std::uint32_t>(attrs_length(attr));
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32  (mb, res_size,      ec);
+          put_u8   (mb, SSH_FXP_ATTRS, ec);
+          put_u32  (mb, request_id,    ec);
+          put_attrs(mb, attr,          ec);
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        break;
+      }
+
+      case SSH_FXP_RENAME:
+      {
+        boost::capy::io_result<> r;
+        const auto oldpath = take_str(cb, r.ec);
+        const auto newpath = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.rename(oldpath, newpath);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+
+      case SSH_FXP_READLINK:
+      {
+        boost::capy::io_result<std::string> r;
+        const auto path = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.readlink(path);
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & target = get<1>(r);
+          const auto res_size = 1u + 4u + 4u
+                              + 4u + static_cast<std::uint32_t>(target.size())
+                              + 4u   // empty longname
+                              + 4u;  // attrs.flags = 0
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size,             ec);
+          put_u8 (mb, SSH_FXP_NAME,         ec);
+          put_u32(mb, request_id,           ec);
+          put_u32(mb, 1u,                   ec);
+          put_str(mb, target,               ec);
+          put_str(mb, std::string_view{},   ec);
+          put_u32(mb, 0u,                   ec);
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        break;
+      }
+
+      case SSH_FXP_SYMLINK:
+      {
+        // OpenSSH convention on the wire: target first, then linkpath.
+        boost::capy::io_result<> r;
+        const auto target = take_str(cb, r.ec);
+        const auto dest   = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.symlink(target, dest);
+
+        response = build_status(my_buffer, request_id, r.ec, ec);
+        break;
+      }
+
+      case SSH_FXP_EXTENDED:
+      {
+        std::error_code parse_ec;
+        const auto ext_name = take_str(cb, parse_ec);
+
+        if (parse_ec)
+        {
+          response = build_status(my_buffer, request_id, parse_ec, ec);
+          break;
+        }
+
+        if (ext_name == "hardlink@openssh.com")
+        {
+          boost::capy::io_result<> r;
+          const auto oldpath = take_str(cb, r.ec);
+          const auto newpath = take_str(cb, r.ec);
+
+          if (!r.ec)
+            r = co_await s.hardlink(std::string(oldpath), std::string(newpath));
+
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        }
+        else if (ext_name == "expand-path@openssh.com")
+        {
+          boost::capy::io_result<std::string> r;
+          const auto path = take_str(cb, r.ec);
+
+          if (!r.ec)
+            r = co_await s.expand_path(std::string(path));
+
+          if (r.ec)
+            response = build_status(my_buffer, request_id, r.ec, ec);
+          else
+          {
+            const auto & name = get<1>(r);
+            const auto res_size = 1u + 4u + 4u
+                                + 4u + static_cast<std::uint32_t>(name.size())
+                                + 4u   // empty longname
+                                + 4u;  // attrs.flags = 0
+            my_buffer.resize(res_size + 4u);
+            auto mb = boost::capy::make_buffer(my_buffer);
+            put_u32(mb, res_size,             ec);
+            put_u8 (mb, SSH_FXP_NAME,         ec);
+            put_u32(mb, request_id,           ec);
+            put_u32(mb, 1u,                   ec);
+            put_str(mb, name,                 ec);
+            put_str(mb, std::string_view{},   ec);
+            put_u32(mb, 0u,                   ec);
+            response = boost::capy::make_buffer(my_buffer);
+          }
+        }
+        else
+        {
+          response = build_status(my_buffer, request_id,
+                std::error_code(SSH_FX_OP_UNSUPPORTED, sftp_category()), ec);
+        }
+        break;
+      }
+
+      default:
+        // Unknown opcode — terminate the worker (and so the connection).
+        co_return std::error_code(SSH_FX_BAD_MESSAGE, sftp_category());
+
+    }
+
+    if (ec)
+      co_return ec;
+
+    auto ll = co_await write_mutex.scoped_lock();
+    if (ll.ec)
+      co_return ll.ec;
+
+    ec = (co_await boost::capy::write(stream, response)).ec;
+    if (ec)
+      co_return ec;
+  }
+
+  co_return std::error_code(boost::capy::error::canceled);
+}
+
+boost::capy::io_task<> serve(boost::capy::any_stream stream, server & s, std::size_t worker_count)
+{
+  if (auto [ec] = co_await init_server(&stream); ec)
+   co_return ec;
+
+  std::vector<unsigned char> buffer;
+  boost::capy::async_mutex read_mutex, write_mutex;
+
+  std::vector<boost::capy::io_task<>> workers;
+  for (auto i = 0u; i <= worker_count; i++)
+    workers.push_back(
+      serve_worker(stream, s, buffer, read_mutex, write_mutex)
+    );
+
+  // when any means that one failed task will cancel all others.
+  auto res = co_await boost::capy::when_any(std::move(workers));
+  if (res.index() == 0u )
+    co_return get<0>(res);
+  else 
+    co_return {};
+  
+
 }
 
 

@@ -202,8 +202,6 @@ struct file
     co_return n;
   }
 
-  std::uint64_t seek(std::uint64_t offset);
-  std::size_t size();
 
   boost::capy::io_task<attributes> fstat();
   boost::capy::io_task<> fsync();
@@ -365,6 +363,46 @@ struct session
 
 };
 
+struct server
+{
+  virtual boost::capy::io_task<std::string>     open(std::string_view path, int accesstype, mode_t mode) = 0;
+  virtual boost::capy::io_task<std::size_t>  read_at(std::string_view handle, std::uint64_t offset, boost::capy::mutable_buffer buffer) = 0;
+  virtual boost::capy::io_task<std::size_t> write_at(std::string_view handle, std::uint64_t offset, boost::capy::const_buffer buffer) = 0;
+
+  virtual boost::capy::io_task<attributes> fstat(std::string_view handle) = 0;
+  virtual boost::capy::io_task<> fsync(std::string_view handle) = 0;
+  virtual boost::capy::io_task<> close(std::string_view handle) = 0;
+
+  
+  
+  virtual boost::capy::io_task<std::string> opendir(std::string_view path) = 0;
+  virtual boost::capy::io_task<std::vector<dir::entry>>
+                                    readdir(std::string handle)    = 0;
+  virtual boost::capy::io_task<>           closedir(std::string_view directory) = 0;
+
+  virtual boost::capy::io_task<attributes> stat (std::string_view path);
+  virtual boost::capy::io_task<attributes> lstat(std::string_view path);
+
+ 
+  virtual boost::capy::io_task<> unlink  (std::string_view path) = 0;
+  virtual boost::capy::io_task<> mkdir   (std::string_view path, mode_t mode) = 0;
+  virtual boost::capy::io_task<> rmdir   (std::string_view path) = 0;
+  virtual boost::capy::io_task<> rename  (std::string_view original, std::string_view newname) = 0;
+  virtual boost::capy::io_task<> chmod   (std::string_view path, mode_t mode) = 0;
+  virtual boost::capy::io_task<> chown   (std::string_view path, uid_t owner, gid_t group) = 0;
+  virtual boost::capy::io_task<> symlink (std::string_view target,  std::string_view dest) = 0;
+  virtual boost::capy::io_task<> hardlink(std::string_view oldpath, std::string_view newpath) = 0;
+  virtual boost::capy::io_task<> setstat (std::string_view path, const attributes & attr) = 0;
+  
+  virtual boost::capy::io_task<> fsetstat(std::string_view handle, const attributes & attr) = 0;
+  
+  virtual boost::capy::io_task<std::string> readlink(         std::string_view path) = 0;
+  virtual boost::capy::io_task<std::string> canonicalize_path(std::string_view path) = 0;
+  virtual boost::capy::io_task<std::string> expand_path(      std::string_view path) = 0;
+  virtual boost::capy::io_task<std::string> home_directory(   std::string_view username) = 0;
+};
+
 boost::capy::io_task<session> init(boost::capy::any_stream stream);
+boost::capy::io_task<> serve(boost::capy::any_stream stream, server & s, std::size_t worker_count = 16ull);
 
 }
