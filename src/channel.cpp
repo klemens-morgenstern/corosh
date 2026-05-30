@@ -5,6 +5,7 @@
 #include <boost/capy/when_all.hpp>
 #include <boost/capy/concept/read_source.hpp>
 #include <boost/capy/concept/write_sink.hpp>
+#include <libssh/callbacks.h>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 
@@ -508,6 +509,143 @@ static_assert(boost::capy::ReadSource<channel>);
 static_assert(boost::capy::WriteSink <channel>);
 static_assert(boost::capy::ReadSource<channel::stderr_t>);
 static_assert(boost::capy::WriteSink <channel::stderr_t>);
+
+channel::callbacks::callbacks()
+{
+  ssh_callbacks_init(&impl_);
+
+  impl_.userdata = this;
+  impl_.channel_signal_function =
+    +[](ssh_session, ssh_channel, const char * sig, void * this_)
+    {
+      static_cast<callbacks*>(this_)->signal(sig);
+    };
+
+  impl_.channel_exit_status_function =
+    +[](ssh_session, ssh_channel, int exit_status, void * this_)
+    {
+      static_cast<callbacks*>(this_)->exit_status(exit_status);
+    };
+
+  impl_.channel_exit_signal_function =
+    +[](ssh_session, ssh_channel, const char * sig, int core,
+        const char * errmsg, const char * lang, void * this_)
+    {
+      static_cast<callbacks*>(this_)->exit_signal(sig, core, errmsg, lang);
+    };
+  impl_.channel_x11_req_function =
+    +[](ssh_session, ssh_channel, int single_connection,
+        const char * auth_protocol, const char * auth_cookie,
+        std::uint32_t screen_number, void * this_)
+    {
+      static_cast<callbacks*>(this_)->x11_req(single_connection,
+                                              auth_protocol, auth_cookie,
+                                              screen_number);
+    };
+
+  impl_.channel_close_function =
+    +[](ssh_session, ssh_channel, void * this_)
+    {
+      static_cast<callbacks*>(this_)->close();
+    };
+
+  impl_.channel_pty_request_function =
+    [](ssh_session, ssh_channel,
+        const char * term, int width, int height,
+        int pxwidth, int pwheight, void * this_)
+    {
+      return static_cast<callbacks*>(this_)->pty_request(term, width, height, pxwidth, pwheight) ? 0 : -1;
+    };
+
+  impl_.channel_pty_window_change_function =
+    [](ssh_session, ssh_channel,
+        int width, int height, int pxwidth, int pwheight,
+        void * this_)
+    {
+      return static_cast<callbacks*>(this_)->pty_window_change(width, height, pxwidth, pwheight) ? 0 : -1;
+    };
+
+  impl_.channel_shell_request_function =
+    [](ssh_session, ssh_channel, void * this_)
+    {
+      return static_cast<callbacks*>(this_)->shell_request() ? 0 : -1;
+    };
+
+  impl_.channel_exec_request_function =
+    [](ssh_session, ssh_channel,
+        const char * exec,
+        void * this_)
+    {
+      return static_cast<callbacks*>(this_)->exec_request(exec) ? 0 : -1;
+    };
+
+  impl_.channel_env_request_function =
+    [](ssh_session, ssh_channel,
+        const char * env_name, const char * env_value,
+        void * this_)
+    {
+      return static_cast<callbacks*>(this_)->env_request(env_name, env_value) ? 0 : -1;
+    };
+
+  impl_.channel_subsystem_request_function =
+    [](ssh_session, ssh_channel,
+        const char * subsystem, void * this_)
+    {
+      return static_cast<callbacks*>(this_)->subsystem_request(subsystem) ? 0 : -1;
+    };
+}
+
+void channel::callbacks::signal(const char * /*signal*/) { }
+void channel::callbacks::exit_status(int /*exit_status*/) { }
+void channel::callbacks::exit_signal(const char * /*signal*/, int /*core*/,
+                                     const char * /*errmsg*/, const char * /*lang*/) { }
+void channel::callbacks::x11_req(int /*single_connection*/,
+                                 const char * /*auth_protocol*/,
+                                 const char * /*auth_cookie*/,
+                                 std::uint32_t /*screen_number*/) { }
+
+void channel::callbacks::close() { }
+
+bool channel::callbacks::pty_request(const char * /*term*/, int /*width*/, int /*height*/,
+                                     int /*pxwidth*/, int /*pwheight*/)
+{
+  return false;
+}
+
+bool channel::callbacks::pty_window_change(int /*width*/, int /*height*/,
+                                           int /*pxwidth*/, int /*pwheight*/)
+{
+  return false;
+}
+
+bool channel::callbacks::shell_request() { return false; }
+
+bool channel::callbacks::exec_request(const char * /*command*/) { return false; }
+
+bool channel::callbacks::env_request(const char * /*env_name*/, const char * /*env_value*/)
+{
+  return false;
+}
+
+bool channel::callbacks::subsystem_request(const char * /*subsystem*/) { return false; }
+
+
+void channel::set_callbacks(callbacks & cb)
+{
+  cb.chan_ = channel_.get();
+  auto rc = ssh_set_channel_callbacks(cb.chan_, &cb.impl_);
+  if (rc != SSH_OK)
+      throw std::system_error(
+            std::error_code(ssh_get_error_code(channel_.get()), ssh_category()),
+            ssh_get_error(channel_.get())
+            );
+}
+
+channel::callbacks::~callbacks()
+{
+  if (chan_ != nullptr)
+    ssh_remove_channel_callbacks(chan_, &impl_);
+}
 
 }
 

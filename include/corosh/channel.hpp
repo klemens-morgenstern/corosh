@@ -6,6 +6,7 @@
 #include <boost/capy/buffers.hpp>
 #include <boost/capy/error.hpp>
 #include <libssh/libssh.h>
+#include <libssh/callbacks.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -202,6 +203,8 @@ struct channel
 
   stderr_t std_err() {return stderr_t{*this};}
 
+  struct callbacks;
+  void set_callbacks(callbacks & cb);
 
  private:
   channel(
@@ -223,7 +226,41 @@ struct channel
   template<typename Function>
   boost::capy::io_task<std::size_t> do_io_(Function f);
 
+  friend struct session;
+
 };
+
+
+struct channel::callbacks
+{
+  callbacks();
+  callbacks(const callbacks & ) = delete;
+
+  virtual void signal(const char *signal);
+  virtual void exit_status(int exit_status);
+  virtual void exit_signal(const char *signal, int core,
+                           const char *errmsg, const char *lang);
+  virtual void x11_req(int single_connection, const char *auth_protocol,
+                       const char *auth_cookie, std::uint32_t screen_number);
+
+  virtual void close();
+
+  virtual bool pty_request(const char *term, int width, int height,
+                           int pxwidth, int pwheight);
+  virtual bool pty_window_change(int width, int height, int pxwidth, int pwheight);
+  virtual bool shell_request();
+  virtual bool exec_request(const char *command);
+  virtual bool env_request(const char *env_name, const char *env_value);
+  virtual bool subsystem_request(const char *subsystem);
+
+  virtual ~callbacks();
+ private:
+  friend struct channel;
+  ssh_channel_callbacks_struct impl_;
+  ssh_channel chan_ = nullptr;
+};
+
+
 
 
 }

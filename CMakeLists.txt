@@ -28,6 +28,7 @@ find_package(Boost REQUIRED COMPONENTS capy corosio system)
 find_package(libssh REQUIRED)
 
 add_library(corosh
+    src/acceptor.cpp
     src/corosh.cpp
     src/channel.cpp
     src/error.cpp
