@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2026 Klemens Morgenstern
+
 #pragma once
 
 #include <boost/capy/io_task.hpp>
@@ -15,6 +18,7 @@
 namespace corosh
 {
 struct session;
+struct message;
 
 struct exit_state
 {
@@ -227,6 +231,7 @@ struct channel
   boost::capy::io_task<std::size_t> do_io_(Function f);
 
   friend struct session;
+  friend struct message;
 
 };
 

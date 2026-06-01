@@ -1,18 +1,26 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2026 Klemens Morgenstern
+
 #pragma once
 
 #include <corosh/error.hpp>
 #include <corosh/channel.hpp>
 #include <corosh/options.hpp>
+#include <corosh/message.hpp>
 #include <boost/capy/ex/this_coro.hpp>
 #include <boost/capy/io_task.hpp>
 #include <boost/capy/error.hpp>
 #include <boost/corosio/tcp_socket.hpp>
 #include <boost/corosio/timer.hpp>
+
+
 #include <libssh/libssh.h>
 #include <libssh/callbacks.h>
 #include <chrono>
 #include <string>
 #include <type_traits>
+
+
 
 namespace corosh
 {
@@ -132,6 +140,7 @@ struct session
   struct client_callbacks;
   void install_client_callbacks(std::unique_ptr<client_callbacks> cb);
 
+  boost::capy::io_task<message> get_message();
   
 
  private:

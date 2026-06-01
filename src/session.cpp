@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2026 Klemens Morgenstern
+
 #include <chrono>
 #include <corosh/session.hpp>
 #include <boost/capy/ex/this_coro.hpp>
@@ -376,6 +379,40 @@ boost::capy::io_task<> session::server_init_kex()
       return ssh_server_init_kex(session_.get());
     }
     );
+}
+
+boost::capy::io_task<message> session::get_message()
+{
+  for (;;)
+  {
+    auto res = ssh_message_get(session_.get());
+    if (res == nullptr)
+    {
+      auto r = ssh_get_poll_flags(session_.get());
+      std::error_code ec;
+      
+      if (r == SSH_READ_PENDING)
+        ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
+      else if (r == SSH_WRITE_PENDING)
+        ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::write));
+      else if (r == (SSH_READ_PENDING | SSH_WRITE_PENDING))
+      {
+        auto v = co_await boost::capy::when_all(
+          socket_->wait(boost::corosio::wait_type::read),
+          socket_->wait(boost::corosio::wait_type::write)
+        );
+        ec = get<0>(v);
+      }
+      else
+        co_return {{}, message{}};
+
+      if (ec)
+        co_return {ec, message()};
+      continue;
+    }
+    
+    co_return {std::error_code{}, message(res, session_.get(), socket_)};
+  }
 }
 
 
