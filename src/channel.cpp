@@ -417,6 +417,11 @@ boost::capy::io_task<std::size_t> channel::read_some(
   return do_some_io_(
     [this, buffer, is_stderr]
     {
+      auto to = ssh_channel_poll_timeout(channel_.get(), 0, is_stderr ? 1 : 0);
+      if (to == 0)
+        return SSH_AGAIN;
+      if (to == SSH_EOF)
+        return SSH_EOF;
       return ssh_channel_read_timeout(channel_.get(), buffer.data(), buffer.size(), is_stderr ? 1 : 0, 0);
     }
   );
@@ -507,6 +512,8 @@ boost::capy::io_task<std::size_t> channel::write(
 }
 
 
+static_assert(boost::capy::WriteStream<channel>);
+static_assert(boost::capy::ReadStream <channel>);
 
 static_assert(boost::capy::ReadSource<channel>);
 static_assert(boost::capy::WriteSink <channel>);
@@ -633,10 +640,12 @@ bool channel::callbacks::env_request(const char * /*env_name*/, const char * /*e
 bool channel::callbacks::subsystem_request(const char * /*subsystem*/) { return false; }
 
 
-void channel::set_callbacks(callbacks & cb)
+
+void channel::add_callbacks(callbacks & cb, bool back)
 {
   cb.chan_ = channel_.get();
-  auto rc = ssh_set_channel_callbacks(cb.chan_, &cb.impl_);
+  
+  auto rc = (back ? ssh_add_channel_callbacks : ssh_set_channel_callbacks)(cb.chan_, &cb.impl_);
   if (rc != SSH_OK)
       throw std::system_error(
             std::error_code(ssh_get_error_code(channel_.get()), ssh_category()),
@@ -644,9 +653,11 @@ void channel::set_callbacks(callbacks & cb)
             );
 }
 
+
+
 channel::callbacks::~callbacks()
 {
-  if (chan_ != nullptr)
+  if (chan_ != nullptr && ssh_channel_is_open(chan_))
     ssh_remove_channel_callbacks(chan_, &impl_);
 }
 

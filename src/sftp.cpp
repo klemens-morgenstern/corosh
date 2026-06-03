@@ -220,7 +220,6 @@ std::size_t match_packet(std::string_view data, std::size_t* hint )
     return std::string_view::npos;
 
   const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(data.data())); 
-
   if (data.size() >= (sz + 4u))
     return sz + 4u;
   else
@@ -1907,6 +1906,7 @@ static boost::capy::io_task<> init_server(boost::capy::any_stream stream)
     auto client_version = take_u32(cb, ec);
     (void)client_version;
 
+
     if (!ec && type != SSH_FXP_INIT)
       ec.assign(SSH_FATAL, ssh_category());
 
@@ -1969,8 +1969,10 @@ boost::capy::io_task<> serve_worker(
       if (res.ec)
           co_return res.ec;
 
+      assert(get<1>(res) > 4u);
+      
       // the packet size. we read at least sz + 4u
-      const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(buffer.data())); 
+      const std::uint32_t sz = ntohl(*reinterpret_cast<const std::uint32_t*>(my_buffer.data())); 
 
       // assign whatever is left to the shared buffer
       buffer.assign(my_buffer.begin() + sz + 4u, my_buffer.end());
@@ -1984,7 +1986,7 @@ boost::capy::io_task<> serve_worker(
     const auto request_id  = take_u32(cb, ec);
 
     boost::capy::const_buffer response;
-
+    
     switch (tp)
     {
       case SSH_FXP_OPEN:
@@ -2174,6 +2176,43 @@ boost::capy::io_task<> serve_worker(
           response = boost::capy::make_buffer(my_buffer);
         } 
       } break;
+      case SSH_FXP_READDIR:
+      {
+        boost::capy::io_result<std::vector<dir::entry>> r;
+        const auto handle = take_str(cb, r.ec);
+
+        if (!r.ec)
+          r = co_await s.readdir(std::string(handle));
+
+        if (r.ec)
+          response = build_status(my_buffer, request_id, r.ec, ec);
+        else
+        {
+          const auto & entries = get<1>(r);
+          // SSH_FXP_NAME: type(1) + id(4) + count(4)
+          //               + count * ((4+name) + (4+longname) + attrs)
+          std::uint32_t res_size = 1u + 4u + 4u;
+          for (const auto & e : entries)
+            res_size += 4u + static_cast<std::uint32_t>(e.name.size())
+                      + 4u + static_cast<std::uint32_t>(e.long_name.size())
+                      + static_cast<std::uint32_t>(attrs_length(e.attr));
+
+          my_buffer.resize(res_size + 4u);
+          auto mb = boost::capy::make_buffer(my_buffer);
+          put_u32(mb, res_size,                                             ec);
+          put_u8 (mb, SSH_FXP_NAME,                                         ec);
+          put_u32(mb, request_id,                                           ec);
+          put_u32(mb, static_cast<std::uint32_t>(entries.size()),           ec);
+          for (const auto & e : entries)
+          {
+            put_str  (mb, e.name,      ec);
+            put_str  (mb, e.long_name, ec);
+            put_attrs(mb, e.attr,      ec);
+          }
+          response = boost::capy::make_buffer(my_buffer);
+        }
+        break;
+      }
       case SSH_FXP_REMOVE:
       {
         boost::capy::io_result<> r;

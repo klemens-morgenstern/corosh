@@ -381,10 +381,9 @@ struct server
   virtual boost::capy::io_task<std::string> opendir(std::string_view path) = 0;
   virtual boost::capy::io_task<std::vector<dir::entry>>
                                     readdir(std::string handle)    = 0;
-  virtual boost::capy::io_task<>           closedir(std::string_view directory) = 0;
 
-  virtual boost::capy::io_task<attributes> stat (std::string_view path);
-  virtual boost::capy::io_task<attributes> lstat(std::string_view path);
+  virtual boost::capy::io_task<attributes> stat (std::string_view path) = 0;
+  virtual boost::capy::io_task<attributes> lstat(std::string_view path) = 0;
 
  
   virtual boost::capy::io_task<> unlink  (std::string_view path) = 0;

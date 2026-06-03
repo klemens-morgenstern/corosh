@@ -48,6 +48,7 @@ struct acceptor
   void set_option(const Option & opt)
   {
     auto rc = ssh_bind_options_set(bind_.get(), opt.option(), opt.data());
+    
     if (rc != SSH_OK)
       throw std::system_error(
               std::error_code(ssh_get_error_code(bind_.get()), ssh_category()),

@@ -85,6 +85,8 @@ struct session
 
   void parse_config(const char * filename = nullptr);
 
+  bool is_open() const;
+
   boost::capy::io_task<> connect(boost::corosio::endpoint ep);
   boost::capy::execution_context&
     context() const noexcept
@@ -132,7 +134,7 @@ struct session
 
 
   // server functions
-  boost::capy::io_task<> server_init_kex();
+  boost::capy::io_task<> handle_key_exchange();
 
   struct server_callbacks;
   void install_server_callbacks(std::unique_ptr<server_callbacks> cb);

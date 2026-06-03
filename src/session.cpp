@@ -9,6 +9,7 @@
 #include <boost/corosio/timer.hpp>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
+#include <system_error>
 
 namespace corosh
 {
@@ -25,6 +26,11 @@ void session::parse_config(const char * filename)
             );
 } 
 
+bool session::is_open() const
+{
+  auto s = ssh_get_status(session_.get());
+  return (s & (SSH_CLOSED | SSH_CLOSED_ERROR)) == 0;
+}
 
 boost::capy::io_task<> session::connect(boost::corosio::endpoint ep)
 {
@@ -222,7 +228,13 @@ boost::capy::io_task<> session::do_op_(Function f)
     if (rc == SSH_OK)
       co_return {};
     if (rc == SSH_ERROR)
-      co_return std::error_code(ssh_get_error_code(session_.get()), ssh_category());
+    {
+      auto e = ssh_get_error_code(session_.get());
+      if (e == 0)
+        e = SSH_FATAL;
+      co_return std::error_code(e, ssh_category());
+    }
+    
 
     std::error_code ec;
     auto r = ssh_get_poll_flags(session_.get());
@@ -371,12 +383,12 @@ auto session::open_forward_port() -> open_forward_port_result
   
 
 
-boost::capy::io_task<> session::server_init_kex()
+boost::capy::io_task<> session::handle_key_exchange()
 {
   return do_op_(
     [this]
     {
-      return ssh_server_init_kex(session_.get());
+      return ssh_handle_key_exchange(session_.get());
     }
     );
 }
@@ -385,12 +397,14 @@ boost::capy::io_task<message> session::get_message()
 {
   for (;;)
   {
+
     auto res = ssh_message_get(session_.get());
     if (res == nullptr)
     {
+      
       auto r = ssh_get_poll_flags(session_.get());
       std::error_code ec;
-      
+
       if (r == SSH_READ_PENDING)
         ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
       else if (r == SSH_WRITE_PENDING)
@@ -403,15 +417,15 @@ boost::capy::io_task<message> session::get_message()
         );
         ec = get<0>(v);
       }
-      else
-        co_return {{}, message{}};
+      else if (!is_open())
+        co_return {std::make_error_code(std::errc::broken_pipe), {}};
+    
 
       if (ec)
-        co_return {ec, message()};
-      continue;
+        co_return {ec, message()};     
     }
-    
-    co_return {std::error_code{}, message(res, session_.get(), socket_)};
+    else
+      co_return {std::error_code{}, message(res, session_.get(), socket_)};
   }
 }
 

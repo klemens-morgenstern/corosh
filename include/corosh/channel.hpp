@@ -208,8 +208,11 @@ struct channel
   stderr_t std_err() {return stderr_t{*this};}
 
   struct callbacks;
-  void set_callbacks(callbacks & cb);
+  void add_callbacks(callbacks & cb, bool back = false);
 
+
+  using native_handle_type = ssh_channel;
+  native_handle_type native_handle() {return channel_.get();}
  private:
   channel(
     ssh_channel channel,

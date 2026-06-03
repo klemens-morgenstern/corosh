@@ -27,7 +27,7 @@ try {
   corosh::session ses{co_await capy::this_coro::executor};
 
   ses.set_option(corosh::options::host("localhost"));
-  ses.set_option(corosh::options::log_verbosity(SSH_LOG_TRACE));
+  ses.set_option(corosh::options::log_verbosity(SSH_LOG_INFO));
   ses.set_option(corosh::options::port(22));
   ses.set_option(corosh::options::user("klemens"));
   
@@ -125,7 +125,11 @@ try {
     if (ecr)
       std::cerr << "read failed :" << ecr  << " - " << ecr.message() << std::endl;
     else
-      std::cout << std::string_view(buffer, r) << std::endl;
+      std::cout 
+        <<   "==========================~/.bash_history============================\n"
+        << std::string_view(buffer, r) 
+        << "\n=====================================================================\n\n"
+        << std::endl;
 
     std::ignore = co_await f.close();
   }
