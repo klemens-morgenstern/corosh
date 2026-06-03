@@ -353,7 +353,7 @@ boost::capy::io_task<std::size_t> channel::do_some_io_(Function f)
     if (r == SSH_READ_PENDING)
     {
       boost::corosio::timer t{socket_->context()};
-      t.expires_after(std::chrono::milliseconds(10));
+      t.expires_after(std::chrono::milliseconds(1));
       ec = (co_await t.wait()).ec;
       
       //ec = get<0>(co_await socket_->wait(boost::corosio::wait_type::read));
